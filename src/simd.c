@@ -36,6 +36,8 @@
 
 #if defined(USE_AVX2)
 #define NUM_REGS 16
+#elif defined(USE_NEON)
+#define NUM_REGS 8
 #elif defined(USE_SSE)
 #define NUM_REGS 8
 #endif
@@ -157,6 +159,106 @@ void simd_add2_sub2(int16_t* input, int16_t *output, int16_t *add1,
         __m256i v2 = _mm256_add_epi16(v, padd2[k]);
         __m256i v3 = _mm256_sub_epi16(v2, psub1[k]);
         po[k] = _mm256_sub_epi16(v3, psub2[k]);
+    }
+}
+
+#elif defined(USE_NEON)
+
+/*
+ * AArch64 NEON implementation.
+ *
+ * The hidden layer contains 512 int16 values. NEON processes eight values
+ * per 128-bit vector. The fully-connected operation intentionally preserves
+ * the original x86 sequence: clamp, 16-bit multiply (including low-word
+ * wraparound), then pairwise signed 16-bit multiply-accumulate.
+ */
+static int32_t hsum_4x32(int32x4_t v)
+{
+    return vaddvq_s32(v);
+}
+
+int32_t simd_fully_connected(int16_t *inputs, int16_t *weights)
+{
+    int k;
+    int32x4_t vsum = vdupq_n_s32(0);
+    const int16x8_t vmin = vdupq_n_s16(0);
+    const int16x8_t vmax = vdupq_n_s16(NNUE_QUANT_QA);
+
+    for (k = 0; k < NNUE_HIDDEN_LAYER_SIZE; k += 8) {
+        int16x8_t vi = vld1q_s16(&inputs[k]);
+        int16x8_t vw = vld1q_s16(&weights[k]);
+        int16x8_t vclamp = vmaxq_s16(vi, vmin);
+        int16x8_t vprod;
+        int32x4_t vlo;
+        int32x4_t vhi;
+
+        vclamp = vminq_s16(vclamp, vmax);
+        vprod = vmulq_s16(vclamp, vw);
+
+        vlo = vmull_s16(vget_low_s16(vprod), vget_low_s16(vclamp));
+        vhi = vmull_s16(vget_high_s16(vprod), vget_high_s16(vclamp));
+        vsum = vaddq_s32(vsum, vaddq_s32(vlo, vhi));
+    }
+
+    return hsum_4x32(vsum);
+}
+
+void simd_add(int16_t *inputs, int16_t *outputs)
+{
+    int k;
+    for (k = 0; k < NNUE_HIDDEN_LAYER_SIZE; k += 8) {
+        int16x8_t a = vld1q_s16(&outputs[k]);
+        int16x8_t b = vld1q_s16(&inputs[k]);
+        vst1q_s16(&outputs[k], vaddq_s16(a, b));
+    }
+}
+
+void simd_sub(int16_t *inputs, int16_t *outputs)
+{
+    int k;
+    for (k = 0; k < NNUE_HIDDEN_LAYER_SIZE; k += 8) {
+        int16x8_t a = vld1q_s16(&outputs[k]);
+        int16x8_t b = vld1q_s16(&inputs[k]);
+        vst1q_s16(&outputs[k], vsubq_s16(a, b));
+    }
+}
+
+void simd_add_sub(int16_t *input, int16_t *output, int16_t *add,
+                  int16_t *sub)
+{
+    int k;
+    for (k = 0; k < NNUE_HIDDEN_LAYER_SIZE; k += 8) {
+        int16x8_t v = vaddq_s16(vld1q_s16(&input[k]),
+                                vld1q_s16(&add[k]));
+        v = vsubq_s16(v, vld1q_s16(&sub[k]));
+        vst1q_s16(&output[k], v);
+    }
+}
+
+void simd_add_sub2(int16_t *input, int16_t *output, int16_t *add,
+                   int16_t *sub1, int16_t *sub2)
+{
+    int k;
+    for (k = 0; k < NNUE_HIDDEN_LAYER_SIZE; k += 8) {
+        int16x8_t v = vaddq_s16(vld1q_s16(&input[k]),
+                                vld1q_s16(&add[k]));
+        v = vsubq_s16(v, vld1q_s16(&sub1[k]));
+        v = vsubq_s16(v, vld1q_s16(&sub2[k]));
+        vst1q_s16(&output[k], v);
+    }
+}
+
+void simd_add2_sub2(int16_t *input, int16_t *output, int16_t *add1,
+                    int16_t *add2, int16_t *sub1, int16_t *sub2)
+{
+    int k;
+    for (k = 0; k < NNUE_HIDDEN_LAYER_SIZE; k += 8) {
+        int16x8_t v = vaddq_s16(vld1q_s16(&input[k]),
+                                vld1q_s16(&add1[k]));
+        v = vaddq_s16(v, vld1q_s16(&add2[k]));
+        v = vsubq_s16(v, vld1q_s16(&sub1[k]));
+        v = vsubq_s16(v, vld1q_s16(&sub2[k]));
+        vst1q_s16(&output[k], v);
     }
 }
 
@@ -320,8 +422,8 @@ void simd_sub(int16_t *inputs, int16_t *outputs)
     }
 }
 
-static void simd_add_sub(int16_t* input, int16_t *output, int16_t *add,
-                         int16_t *sub)
+void simd_add_sub(int16_t* input, int16_t *output, int16_t *add,
+                  int16_t *sub)
 {
     int k;
 
@@ -330,8 +432,8 @@ static void simd_add_sub(int16_t* input, int16_t *output, int16_t *add,
     }
 }
 
-static void simd_add_sub2(int16_t* input, int16_t *output, int16_t *add,
-                          int16_t *sub1, int16_t *sub2)
+void simd_add_sub2(int16_t* input, int16_t *output, int16_t *add,
+                   int16_t *sub1, int16_t *sub2)
 {
     int k;
 
