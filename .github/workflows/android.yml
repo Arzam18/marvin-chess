@@ -1,0 +1,147 @@
+name: Build Marvin for Android ARM64
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'src/**'
+      - 'import/**'
+      - 'res/eval.nnue'
+      - 'Makefile'
+      - '.github/workflows/android.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Android ARM64 NEON Dotprod (embedded NNUE)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout Marvin source
+        uses: actions/checkout@v4
+
+      - name: Locate Android NDK
+        id: ndk
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${ANDROID_NDK_LATEST_HOME:-}" && -d "$ANDROID_NDK_LATEST_HOME" ]]; then
+            NDK="$ANDROID_NDK_LATEST_HOME"
+          elif [[ -n "${ANDROID_NDK_HOME:-}" && -d "$ANDROID_NDK_HOME" ]]; then
+            NDK="$ANDROID_NDK_HOME"
+          else
+            SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+            NDK="$(find "$SDK/ndk" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -n 1)"
+          fi
+
+          if [[ -z "${NDK:-}" || ! -d "$NDK" ]]; then
+            echo "Android NDK not found on this runner" >&2
+            exit 1
+          fi
+
+          echo "ndk=$NDK" >> "$GITHUB_OUTPUT"
+          echo "Using NDK: $NDK"
+
+      - name: Verify embedded NNUE source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s res/eval.nnue
+          test -s import/incbin/incbin.h
+
+          NETWORK_SIZE="$(stat -c '%s' res/eval.nnue)"
+          echo "Marvin embedded NNUE: ${NETWORK_SIZE} bytes"
+
+          if (( NETWORK_SIZE < 100000 )); then
+            echo "NNUE file is unexpectedly small" >&2
+            exit 1
+          fi
+
+      - name: Build Marvin ARM64 executable
+        shell: bash
+        env:
+          ANDROID_NDK: ${{ steps.ndk.outputs.ndk }}
+        run: |
+          set -euo pipefail
+
+          TOOLCHAIN="$ANDROID_NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CC="$TOOLCHAIN/aarch64-linux-android24-clang"
+
+          if [[ ! -x "$CC" ]]; then
+            echo "Android ARM64 C compiler not found: $CC" >&2
+            exit 1
+          fi
+
+          make clean || true
+
+          make -j2 \
+            arch=aarch64 \
+            variant=release \
+            version=6.3.0 \
+            nnuenet=res/eval.nnue \
+            CC="$CC" \
+            EXTRACFLAGS="-march=armv8.2-a+dotprod -mtune=cortex-a76 -fPIE" \
+            LDFLAGS="-lm -Wl,-pie"
+
+          test -s marvin
+
+          mkdir -p build
+          cp marvin build/marvin-6.3.0-android-arm64
+
+          echo "Executable details:"
+          file build/marvin-6.3.0-android-arm64
+          readelf -hW build/marvin-6.3.0-android-arm64 | grep -E 'Class:|Machine:|Type:'
+          ls -lh build/marvin-6.3.0-android-arm64 res/eval.nnue
+
+      - name: Verify ARM64 executable and embedded NNUE
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          BIN="build/marvin-6.3.0-android-arm64"
+
+          readelf -hW "$BIN" | grep -q 'AArch64' || {
+            echo "Output is not an AArch64 executable" >&2
+            exit 1
+          }
+
+          SYMBOLS="$(readelf -sW "$BIN")"
+
+          START_ADDR="$(awk '$NF == "nnue_net_data" {print $2; exit}' <<< "$SYMBOLS")"
+          END_ADDR="$(awk '$NF == "nnue_net_end" {print $2; exit}' <<< "$SYMBOLS")"
+
+          if [[ -z "$START_ADDR" || -z "$END_ADDR" ]]; then
+            echo "Embedded NNUE symbols were not found" >&2
+            grep 'nnue_net_' <<< "$SYMBOLS" || true
+            exit 1
+          fi
+
+          python3 - "$START_ADDR" "$END_ADDR" "$(stat -c '%s' res/eval.nnue)" <<'PY'
+          import sys
+
+          start = int(sys.argv[1], 16)
+          end = int(sys.argv[2], 16)
+          expected = int(sys.argv[3])
+          actual = end - start
+
+          print(f"Embedded NNUE start: 0x{start:x}")
+          print(f"Embedded NNUE end:   0x{end:x}")
+          print(f"Embedded NNUE size:  {actual:,} bytes")
+          print(f"Source NNUE size:    {expected:,} bytes")
+
+          if actual != expected:
+              raise SystemExit("Embedded NNUE size does not match res/eval.nnue")
+
+          print("Embedded NNUE verification successful.")
+          PY
+
+      - name: Upload Marvin engine
+        uses: actions/upload-artifact@v4
+        with:
+          name: Marvin-6.3.0-Android-ARM64-NEON-Dotprod-Embedded-NNUE
+          path: build/marvin-6.3.0-android-arm64
+          if-no-files-found: error
